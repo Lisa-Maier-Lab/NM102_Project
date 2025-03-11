@@ -1,0 +1,236 @@
+---
+title: "Mice 16S rRNA seq samples alpha- and beta-diversity"
+output: html_notebook
+---
+
+Jacobo de la Cuesta-Zuluaga. August 2022.
+
+The aim of this notebook is to perform alpha- and beta-diversity calculations and plots
+
+# Libraries
+```{r}
+library(tidyverse)
+library(conflicted)
+library(GUniFrac)
+library(vegan)
+library(rstatix)
+library(ggthemes)
+```
+
+```{r}
+conflict_prefer("filter", "dplyr")
+```
+
+# Paths
+```{r}
+# Project directories
+base_dir = "/mnt/volume_1/dm_main/projects"
+dada2_dir = file.path(base_dir, "2022_08_Nalini_Large_16S/dada2_out")
+clean_tables_dir = file.path(base_dir, "2022_08_Nalini_Large_16S/clean_tables")
+fig_dir = file.path(base_dir, "2022_08_Nalini_Large_16S/figures")
+
+# Metadata
+mice_metadata_raw = file.path(clean_tables_dir, "Mice_clean_metadata.tsv") %>% 
+  read_tsv() 
+
+mice_metadata = mice_metadata_raw %>% 
+  filter(Sample != "Puffer", Condition != "MPN") %>% 
+  mutate(Condition = factor(Condition, levels = c("Untreated", "NP", "NM102-NP")))
+
+# ASV tables
+mice_asv_full = file.path(clean_tables_dir, "mice_asv_full.tsv") %>% 
+  read_tsv() %>% 
+  filter(Sample  %in% mice_metadata$Sample)
+
+mice_asv_filt = file.path(clean_tables_dir, "mice_ASV_filtered.tsv") %>% 
+  read_tsv() %>% 
+  filter(Sample  %in% mice_metadata$Sample)
+
+mice_asv_decontam = file.path(clean_tables_dir, "mice_ASV_decontam.tsv") %>% 
+  read_tsv() %>% 
+  filter(Sample  %in% mice_metadata$Sample)
+
+# taxonomy table
+mice_taxonomy = file.path(dada2_dir, "Nalini_large_taxonomy_table.tsv") %>% 
+  read_tsv()
+
+# Phylogeny
+mice_tree_raw =  file.path(dada2_dir, "Nalini_large_tree.tre") %>% 
+   ape::read.tree()
+
+mice_tree = mice_tree_raw %>% 
+  phytools::midpoint.root()
+
+```
+## Transform tables
+# Rarefy to an equal sampling depth
+```{r}
+# Rarefy and save to table
+# mice
+# Using filtered data
+mice_rare_obj = mice_asv_filt %>% 
+  column_to_rownames("Sample") %>% 
+  GUniFrac::Rarefy()
+
+
+mice_rare = mice_rare_obj$otu.tab.rff %>% 
+  as.data.frame() %>% 
+  rownames_to_column("Sample")
+
+```
+
+```{r}
+# Non-rarefied sample depth summary
+mice_asv_filt %>% 
+  select(-Sample) %>% 
+  rowSums() %>% 
+  summary()
+
+# Rarefied sample depth summary
+mice_rare %>% 
+  select(-Sample) %>% 
+  rowSums() %>% 
+  summary
+
+```
+## Relative abundance
+```{r}
+# Relatve abundance tables
+mice_relabund = mice_asv_filt %>%
+  column_to_rownames("Sample") %>% 
+  decostand(method = "total", MARGIN = 1) %>% 
+  rownames_to_column("Sample")
+
+mice_relabund_full = mice_asv_full %>% 
+  column_to_rownames("Sample") %>% 
+  decostand(method = "total", MARGIN = 1) %>% 
+  rownames_to_column("Sample")
+```
+
+## Long format table
+```{r}
+family_relabund_long = mice_relabund %>% 
+  pivot_longer(cols = -Sample, names_to = "ID", values_to = "Relabund") %>% 
+  left_join(mice_taxonomy, by = "ID") %>% 
+  group_by(Sample, Family) %>% 
+  summarize(sum_relabund = sum(Relabund)) %>% 
+  ungroup() %>% 
+  mutate(Family = if_else(is.na(Family), "Other", Family))
+```
+# Plots
+## Barplots
+```{r}
+# Restrict barplots to families with mean abundance > 1 % in infected mice
+top_abund_families = family_relabund_long %>% 
+  group_by(Family) %>% 
+  summarise(mean_abund = mean(sum_relabund*100)) %>% 
+  arrange(-mean_abund) %>% 
+  filter(mean_abund > 1) %>% 
+  mutate(plot_colors = tableau_color_pal('Tableau 20')(20)[1:nrow(.)])
+
+
+# Barplot colors
+plot_colors = top_abund_families$plot_colors
+names(plot_colors) = top_abund_families$Family
+plot_colors = c(plot_colors, Other = "black")
+
+
+```
+
+
+```{r fig.height=7, fig.width=5}
+# Create df for barplot
+# Combine families with mean abund < 1% into 'other'
+
+# Determine most abundant families
+family_top = family_relabund_long %>% 
+  mutate(sum_relabund = sum_relabund*100) %>% 
+  filter(Family %in% top_abund_families$Family) %>% 
+  select(Sample, Family, sum_relabund)
+
+# Families in 'other'
+family_other = family_relabund_long %>% 
+  mutate(sum_relabund = sum_relabund*100) %>% 
+  filter(!(Family %in% top_abund_families$Family)) %>% 
+  group_by(Sample) %>% 
+  summarize(sum_relabund = sum(sum_relabund)) %>% 
+  ungroup() %>% 
+  mutate(Family = "Other") %>% 
+  select(Sample, Family, sum_relabund)
+
+# Combine
+family_plot_df = bind_rows(family_top, family_other) %>% 
+  left_join(mice_metadata,  by = "Sample") %>% 
+  select(Sample, Family, sum_relabund, Condition)
+
+# Order samples based on the most abundant family
+samples_order = family_plot_df %>% 
+  filter(Family == "Muribaculaceae") %>% 
+  arrange(Condition, sum_relabund) %>% 
+  pull(Sample)
+
+family_plot_df = family_plot_df %>% 
+  mutate(Sample = factor(Sample, levels = samples_order))
+```
+
+
+```{r fig.height=9, fig.width=7}
+# Create plot
+family_barplot = family_plot_df %>% 
+  ggplot(aes(x = Sample, y = sum_relabund, fill = Family)) +
+    geom_col() +
+    theme_light() +
+    facet_wrap(~Condition, scales = "free_x", nrow = 1, strip.position = "top") +
+    scale_fill_manual(values = plot_colors) +
+    theme(text = element_text(size=10), 
+          axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(x = "Sample", y = "Relative abundance (%)") +
+    theme(legend.position="bottom", 
+          text = element_text(size = 12), 
+          legend.key.size = unit(0.3, "cm")) +
+    scale_y_continuous(expand = c(0, 0), limits = c(0, NA)) +
+    guides(fill = guide_legend(nrow = 5))
+
+family_barplot
+
+ggsave(file.path(fig_dir, "family_barplot.pdf"), family_barplot,  height = 9, width = 7)
+```
+
+
+```{r fig.height=9, fig.width=6}
+family_barplot_alt = family_plot_df %>%
+  filter(Condition %in% c("Untreated", "NM102-NP")) %>% 
+  ggplot(aes(x = Sample, y = sum_relabund, fill = Family)) +
+    geom_col() +
+    theme_light() +
+    facet_wrap(~Condition, scales = "free_x", nrow = 1, strip.position = "top") +
+    scale_fill_manual(values = plot_colors) +
+    theme(text = element_text(size=10), 
+          axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(x = "Sample", y = "Relative abundance (%)") +
+    theme(legend.position="bottom", 
+          text = element_text(size = 12), 
+          legend.key.size = unit(0.3, "cm")) +
+    scale_y_continuous(expand = c(0, 0), limits = c(0, NA)) +
+    guides(fill = guide_legend(nrow = 5))
+
+family_barplot_alt
+
+ggsave(file.path(fig_dir, "family_barplot_NT-MN102.pdf"), family_barplot_alt,  height = 9, width = 6)
+```
+
+## Source data
+```{r}
+family_plot_source = family_plot_df %>% 
+  filter(Condition %in% c("Untreated", "NM102-NP")) %>% 
+  rename("Percentage" = "sum_relabund")
+
+family_plot_source %>% 
+  write_tsv(file.path(clean_tables_dir, "6A_Barplot_source.tsv"))
+```
+
+
+# Session Info
+```{r}
+sessionInfo()
+```

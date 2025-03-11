@@ -1,0 +1,318 @@
+---
+title: "Tidy ASV and metadata tables"
+output: html_notebook
+---
+
+Jacobo de la Cuesta-Zuluaga. August 2022.
+
+The aim of this notebook is to process perform alpha diversity analyses from mice 16S data
+
+# Libraries
+```{r}
+library(tidyverse)
+library(conflicted)
+library(GUniFrac)
+library(vegan)
+library(rstatix)
+library(decontam)
+library(PERFect)
+```
+
+```{r}
+conflict_prefer("filter", "dplyr")
+```
+
+# Paths
+```{r}
+# Project directories
+base_dir = "Q:/NAS/AG_Maier/Amplicon_Sequencing/Projects"
+mice_16S_dir = file.path(base_dir, "22_08_Nalini_Large_16S/dada2_out")
+metadata_dir = file.path(base_dir, "22_08_Nalini_Large_16S/metadata")
+
+mice_16S_dir %>% 
+  list.files(full.names = TRUE)
+
+# ASV table
+mice_asv_raw = file.path(mice_16S_dir, "Nalini_large_ASV_table.tsv") %>% 
+  read_tsv()
+
+# taxonomy table
+mice_tax_raw = file.path(mice_16S_dir, "Nalini_large_taxonomy_table.tsv") %>% 
+  read_tsv()
+
+
+# Phylogeny
+mice_tree_raw =  file.path(mice_16S_dir, "Nalini_large_tree.tre") %>% 
+   ape::read.tree()
+
+# Metadata
+mice_meta_raw = file.path(metadata_dir, "Nalini_metadata.txt")  %>% 
+  read_tsv()
+
+# DNA Quantification
+mice_dna = file.path(metadata_dir, "Nalini_QC.txt")  %>% 
+  read_tsv(locale = )
+
+# Output dir
+output_dir = file.path(base_dir, "22_08_Nalini_Large_16S/clean_tables")
+dir.create(output_dir)
+```
+
+# Clean data tables
+## Metadata
+```{r}
+# Metadata
+mice_meta = mice_meta_raw %>% 
+  mutate(source = factor(Source), 
+         Condition = case_when(Condition == "NP-NM102" ~ "NM102-NP", 
+                               Condition == "NM102-NP 1x" ~ "NM102-NP", 
+                               Condition == "NP6IP" ~ "NP", 
+                               Condition == "NT" ~ "Untreated",
+                               Sample == "Puffer" ~ "Sequencing-blank",
+                               TRUE ~ Condition))
+
+mice_meta %>% head
+```
+
+# Full ASV table
+```{r}
+mice_asv_full = mice_asv_raw %>% 
+  separate(Sample, into = c("Sample", "tmp1"), sep = "_") %>% 
+  select(-c(tmp1)) %>% 
+  filter(Sample %in% mice_meta$Sample) 
+
+# Print
+mice_asv_full[1:10, 1:10]
+```
+
+
+# Taxonomy
+```{r}
+mice_tax = mice_tax_raw
+
+mice_tax %>% head
+```
+
+
+## Filter with Decontam
+```{r}
+# Create table of DNA concentration
+# Specify control samples
+# Zero values not allowed, add a minimum value
+mice_dna_filt = mice_dna %>% 
+  filter(Sample %in% mice_asv_full$Sample) %>% 
+  mutate(is.neg = if_else(Sample == "Puffer", TRUE, FALSE), 
+         Concentration = if_else(Concentration == 0, 0.01, Concentration))
+
+# Make sure names match
+mice_asv_full$Sample %in% mice_dna_filt$Sample
+
+mice_dna_filt$Sample %in% mice_asv_full$Sample
+```
+
+
+
+```{r}
+# Convert table to matrix
+mice_asv_matrix =  mice_asv_full %>% 
+  column_to_rownames("Sample") %>% 
+  as.matrix()
+
+# Run decontam
+# Do not aply threshold cut-off to get compete table
+contaminant_asv_nofilt = isContaminant(seqtab = mice_asv_matrix, 
+                conc = mice_dna_filt$Concentration, 
+                neg = mice_dna_filt$is.neg, 
+                method = "either", 
+                threshold = 1) %>% 
+  rownames_to_column("ID") %>% 
+  left_join(mice_tax_raw,  by = "ID") %>% 
+  arrange(-freq)
+
+# Plot values
+contaminant_asv_nofilt %>% 
+  ggplot(aes(x = p.freq)) +
+    geom_histogram(bins = 30) +
+    theme_light() +
+    geom_vline(xintercept = 0.3)
+
+contaminant_asv_nofilt %>% 
+  ggplot(aes(x = p.prev)) +
+    geom_histogram(bins = 30) +
+    theme_light() +
+    geom_vline(xintercept = 0.3)
+```
+
+```{r fig.height=7}
+# Set threshold and execute decontam
+# See https://github.com/benjjneb/decontam/issues/68
+decontam_thershold = 0.3
+contaminant_asv_filt = isContaminant(seqtab = mice_asv_matrix, 
+                conc = mice_dna_filt$Concentration, 
+                neg = mice_dna_filt$is.neg, 
+                method = "combined", 
+                threshold = decontam_thershold)  %>% 
+  filter(contaminant)
+
+# Add taxonomy to contaminant table
+contaminant_asv_tax = contaminant_asv_filt %>% 
+  rownames_to_column("ID") %>%
+  left_join(mice_tax_raw) %>% 
+  arrange(-freq)
+
+contaminant_asv_tax
+```
+
+```{r fig.height=9}
+#Plot
+plot_frequency(mice_asv_matrix, 
+               rownames(contaminant_asv_filt), 
+               conc = mice_dna_filt$Concentration)
+```
+
+
+```{r}
+# Create table
+mice_decontam_asv = mice_asv_full %>% 
+  select(-one_of(contaminant_asv_tax$ID))
+
+mice_decontam_asv %>% 
+  head
+```
+
+
+## Filter with PERFect
+```{r}
+# ASV table
+# Run PERFect filtering
+# First simultaneous and use those p-values for permutation
+mice_filt_sim = mice_asv_full %>% 
+  column_to_rownames("Sample") %>% 
+  PERFect_sim(X = .)
+
+# Run PERFect filtering
+mice_filt_perm = mice_asv_full %>% 
+  column_to_rownames("Sample") %>% 
+  PERFect_perm(X = .,
+               algorithm = "fast",
+               rollmean  = FALSE,
+               pvals_sim = mice_filt_sim)
+
+
+# Convert to data frame
+mice_filt_asv = mice_filt_perm$filtX %>% 
+  as.data.frame() %>% 
+  rownames_to_column("Sample")
+
+```
+
+
+```{r}
+# Total asvs
+mice_asv_full %>% dim
+
+# Filtered ASVs
+mice_filt_asv %>% 
+  dim
+```
+
+
+## Compare results of PERFect and decontam
+```{r}
+# Contribution of retained ASVs to total reads
+# Total reads per sample
+mice_total_reads = mice_asv_full %>% 
+  column_to_rownames("Sample") %>% 
+  rowSums()
+
+# Retained ASVs 
+PERFect_reads = mice_filt_asv %>% 
+  column_to_rownames("Sample") %>% 
+  rowSums()
+
+decontam_reads = mice_decontam_asv %>% 
+  column_to_rownames("Sample") %>% 
+  rowSums()
+
+mice_reads_sample = data.frame(mice_total_reads, PERFect_reads, decontam_reads) %>% 
+  rownames_to_column("Sample") %>% 
+  filter(Sample != "Puffer") %>% 
+  mutate(PERFect_per = round((PERFect_reads/mice_total_reads)*100, 2), 
+         decontam_per = round((decontam_reads/mice_total_reads)*100, 2))
+```
+
+```{r fig.width=7, fig.height=7}
+# Compare results
+# Do not take blank into account
+mice_reads_sample %>%
+  select(PERFect_per, decontam_per) %>% 
+  summary(decontam_reads)
+
+
+mice_reads_sample %>% 
+  ggplot(aes(x = PERFect_per, y = decontam_per)) +
+    geom_point() +
+    theme_light() +
+    coord_cartesian(xlim = c(75,100), 
+                    ylim = c(75,100)) +
+    labs(x = "Reads retained post-PERFect (%)", 
+         y = "Reads retained post-decontam (%)")
+
+mice_decontam_asv %>% 
+  ncol() %>% 
+  magrittr::subtract(. , 1)
+
+mice_filt_asv %>% 
+  ncol() %>% 
+  magrittr::subtract(. , 1)
+```
+
+```{r}
+# Extract retained ASV IDs
+filt_retained = mice_filt_asv %>% 
+  select(-Sample) %>% 
+  colnames()
+
+decontam_retained = mice_decontam_asv %>% 
+  select(-Sample) %>% 
+  colnames()
+
+contaminant_taxonomy = mice_tax_raw %>% 
+  mutate(contaminant_decontam = !(ID %in% decontam_retained), 
+         contaminant_PERFect = !(ID %in% filt_retained)) %>% 
+  relocate(ID, contaminant_decontam, contaminant_PERFect) %>% 
+  arrange(desc(contaminant_decontam), desc(contaminant_PERFect))
+```
+
+```{r}
+contaminant_taxonomy %>% 
+  select(ID, contaminant_decontam, contaminant_PERFect, Name)
+```
+
+# Write files
+```{r}
+# Gnoto mice
+write_tsv(mice_asv_full, 
+          file.path(output_dir, "mice_asv_full.tsv"))
+
+# mice mice tables and contaminant taxonomy
+write_tsv(mice_filt_asv, 
+          file.path(output_dir, "mice_ASV_filtered.tsv"))
+
+write_tsv(mice_decontam_asv, 
+          file.path(output_dir, "mice_ASV_decontam.tsv"))
+
+write_tsv(contaminant_taxonomy, 
+          file.path(output_dir, "Filter_decontam_taxonomy.tsv"))
+
+# Clean metadata table
+write_tsv(mice_meta, 
+          file.path(output_dir, "Mice_clean_metadata.tsv"))
+
+```
+
+# Session Info
+```{r}
+sessionInfo()
+```
+

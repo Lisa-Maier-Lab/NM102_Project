@@ -1,0 +1,373 @@
+---
+title: "Mice 16S rRNA seq samples alpha- and beta-diversity"
+output: html_notebook
+---
+
+Jacobo de la Cuesta-Zuluaga. August 2022.
+
+The aim of this notebook is to perform alpha- and beta-diversity calculations and plots
+
+# Libraries
+```{r}
+library(tidyverse)
+library(conflicted)
+library(GUniFrac)
+library(vegan)
+library(rstatix)
+library(ggpackets)
+```
+
+```{r}
+conflict_prefer("filter", "dplyr")
+```
+
+# Paths
+```{r}
+# Project directories
+base_dir = "/mnt/volume_1/dm_main/projects"
+dada2_dir = file.path(base_dir, "2022_08_Nalini_Large_16S/dada2_out")
+clean_tables_dir = file.path(base_dir, "2022_08_Nalini_Large_16S/clean_tables")
+fig_dir = file.path(base_dir, "2022_08_Nalini_Large_16S/figures")
+
+# Metadata
+mice_metadata_raw = file.path(clean_tables_dir, "Mice_clean_metadata.tsv") %>% 
+  read_tsv() 
+
+mice_metadata = mice_metadata_raw %>% 
+  filter(Sample != "Puffer", Condition != "MPN") %>% 
+  mutate(Condition = factor(Condition, levels = c("Untreated", "NP", "NM102-NP")))
+
+# ASV tables
+mice_asv_full = file.path(clean_tables_dir, "mice_asv_full.tsv") %>% 
+  read_tsv() %>% 
+  filter(Sample  %in% mice_metadata$Sample)
+
+mice_asv_filt = file.path(clean_tables_dir, "mice_ASV_filtered.tsv") %>% 
+  read_tsv() %>% 
+  filter(Sample  %in% mice_metadata$Sample)
+
+mice_asv_decontam = file.path(clean_tables_dir, "mice_ASV_decontam.tsv") %>% 
+  read_tsv() %>% 
+  filter(Sample  %in% mice_metadata$Sample)
+
+# taxonomy table
+mice_taxonomy = file.path(dada2_dir, "Nalini_large_taxonomy_table.tsv") %>% 
+  read_tsv()
+
+# Phylogeny
+mice_tree_raw =  file.path(dada2_dir, "Nalini_large_tree.tre") %>% 
+   ape::read.tree()
+
+mice_tree = mice_tree_raw %>% 
+  phytools::midpoint.root()
+
+```
+
+# Calculate a-diversity indices
+## Rarefy to an equal sampling depth
+```{r}
+# Rarefy and save to table
+# mice
+# Using filtered data
+mice_rare_obj = mice_asv_filt %>% 
+  column_to_rownames("Sample") %>% 
+  GUniFrac::Rarefy()
+
+
+mice_rare = mice_rare_obj$otu.tab.rff %>% 
+  as.data.frame() %>% 
+  rownames_to_column("Sample")
+
+```
+
+```{r}
+# Non-rarefied sample depth summary
+mice_asv_filt %>% 
+  select(-Sample) %>% 
+  rowSums() %>% 
+  summary()
+
+# Rarefied sample depth summary
+mice_rare %>% 
+  select(-Sample) %>% 
+  rowSums() %>% 
+  summary
+
+```
+
+## Indices
+```{r}
+# Shannon index
+mice_shannon = mice_rare %>% 
+  column_to_rownames("Sample") %>% 
+  diversity(index = "shannon", MARGIN = 1)
+
+
+# Species richness
+mice_richness = mice_rare %>% 
+  column_to_rownames("Sample") %>% 
+  specnumber()
+
+# Create data frame with both indices
+mice_alpha = mice_rare %>% 
+  select("Sample") %>% 
+  bind_cols(shannon = mice_shannon, richness = mice_richness) %>% 
+  left_join(mice_metadata, by = "Sample")
+```
+
+
+
+# Calculate beta-diversity
+```{r}
+# Prune trees
+mice_tax = mice_taxonomy %>% 
+  filter(ID %in% colnames(mice_asv_filt))
+
+mice_tree = ape::drop.tip(mice_tree,
+                          mice_tree$tip.label[-match(mice_tax$Seq, mice_tree$tip.label)])
+
+# Replace seq for ASV name in tips
+mice_tree$tip.label = mice_tax[match(mice_tree$tip.label, mice_tax$Seq), ] %>% 
+  pull(ID)
+
+```
+
+```{r}
+# UniFrac distances
+mice_unifracs = mice_rare %>% 
+  column_to_rownames("Sample") %>% 
+  as.data.frame %>% 
+  GUniFrac(otu.tab = ., mice_tree, alpha = c(0, 1))
+
+# Extract matrices and convert to distance objects
+mice_Wunifrac =  mice_unifracs$unifracs[, , "d_1"]
+mice_Uunifrac =  mice_unifracs$unifracs[, , "d_UW"] 
+```
+
+# Summary stats and hypothesis testing
+## Alpha diversity
+```{r}
+# Summary stats
+mice_alpha %>%
+  group_by(Condition) %>% 
+  get_summary_stats(shannon, type = "common")
+```
+
+```{r}
+# Determine whether there are significant differences in the Shannon diversity between treatments
+mice_alpha %>% 
+  kruskal_test(shannon~Condition)
+
+mice_alpha %>% 
+  wilcox_test(shannon~Condition, p.adjust.method = "BH", ref.group = "Untreated") 
+```
+
+## Beta diversity
+```{r}
+# Weighted UniFrac
+# Regular PERMANOVA test
+adonis2(as.dist(mice_Wunifrac) ~ mice_metadata$Condition, 
+        permutations = 9999) %>% 
+  broom::tidy()
+
+# Pairwise PERMANOVA comparisons
+pairwiseAdonis::pairwise.adonis(as.dist(mice_Wunifrac), 
+                                mice_metadata$Condition, 
+                                p.adjust.m = "BH", 
+                                perm = 9999) %>% 
+  arrange(p.adjusted)
+
+# Unweighted UniFrac
+# Regular PERMANOVA test
+adonis2(as.dist(mice_Uunifrac) ~ mice_metadata$Condition, 
+        permutations = 9999) %>% 
+  broom::tidy() 
+
+# Pairwise PERMANOVA comparisons
+pairwiseAdonis::pairwise.adonis(as.dist(mice_Uunifrac), 
+                                mice_metadata$Condition, 
+                                p.adjust.m = "BH", 
+                                perm = 9999) %>% 
+  arrange(p.adjusted)
+```
+
+
+
+# Plots
+```{r}
+# Palette
+Col_vector = c("Untreated" = "#666666", "NP" = "#cb904d", "NM102-NP" = "#5ad2f4")
+```
+
+## Alpha diversity
+```{r fig.height=5, fig.width=5}
+
+
+plot_pval_df = ggpubr::compare_means(shannon ~ Condition, data = mice_alpha, ref.group = "Untreated")
+
+mice_shannon_plot = mice_alpha %>% 
+  ggplot(aes(x = factor(Condition), y = shannon)) +
+    geom_jitter(aes(fill = Condition),  
+                color = "black", 
+                position = position_jitter(height = 0, width = 0.1), size = 3, pch = 21) +
+    scale_fill_manual(values = Col_vector) +
+    stat_summary(fun.data=mean_se, fun.args = list(mult=1),
+        geom="errorbar", color="black", width=0.1, size = 0.8) +
+    stat_summary(fun=mean, geom="point", color="black", size = 3) +
+    theme_light() +
+    theme(text = element_text(size=12), legend.position = "bottom") +
+    #coord_cartesian(ylim = c(1.75,4.5)) + 
+    labs(x = "Treatment", y = "Shannon Index", fill = "Treatment") +
+    ggpubr::stat_pvalue_manual(plot_pval_df, label = "{p.signif}", y.position = c(4.6, 4.7))
+
+mice_shannon_plot
+```
+
+## Beta diversity
+### PCoA
+```{r}
+# Perform PCoA
+mice_Wunifrac_PCoA = mice_Wunifrac %>%
+  cmdscale(., k=3, eig = T)
+mice_Uunifrac_PCoA = mice_Uunifrac %>%
+  cmdscale(., k=3, eig = T)
+
+# PCo %s
+mice_Wunifrac_PCos = ((mice_Wunifrac_PCoA$eig/sum(mice_Wunifrac_PCoA$eig)) * 100) %>%
+  map_dbl(function(x) round(x, 2))
+
+mice_Uunifrac_PCoS = ((mice_Uunifrac_PCoA$eig/sum(mice_Uunifrac_PCoA$eig)) * 100) %>%
+  map_dbl(function(x) round(x, 2))
+ 
+# Tables for plots 
+WuniFracs_plot_df = mice_Wunifrac_PCoA$points %>%
+  as.data.frame() %>%
+  rownames_to_column("Sample") %>%
+  left_join(mice_metadata, by = "Sample") 
+
+UuniFracs_plot_df = mice_Uunifrac_PCoA$points %>%
+  as.data.frame() %>%
+  rownames_to_column("Sample") %>%
+  left_join(mice_metadata, by = "Sample")
+
+```
+
+```{r fig.height=8, fig.width=8}
+WuniFracs_plot = WuniFracs_plot_df %>% 
+  ggplot(aes(x = V1, y = V2)) +
+    geom_point(aes(fill = Condition), size = 3, color = "black", pch = 21) +
+    scale_fill_manual(values = Col_vector) +
+    theme_light() +
+    labs(x = str_glue("Weighted UniFrac\nPCo1 ({per_var}%)", per_var = mice_Wunifrac_PCos[1]),
+         y = str_glue("Weighted UniFrac\nPCo2 ({per_var}%)", per_var = mice_Wunifrac_PCos[2]),
+         color = "Treatment") +
+    coord_fixed(1)
+    #annotate("text", x = 0.05, y = 0.05, label = "p = 0.40\nR-squared = 0.10", hjust = 0)
+
+UuniFracs_plot = UuniFracs_plot_df %>% 
+  ggplot(aes(x = V1, y = V2)) +
+    geom_point(aes(fill = Condition), size = 3,  color = "black",pch = 21) +
+    scale_fill_manual(values = Col_vector) +
+    theme_light() +
+    labs(x = str_glue("Unweighted UniFrac\nPCo1 ({per_var}%)", per_var = mice_Uunifrac_PCoS[1]),
+         y = str_glue("Unweighted UniFrac\nPCo2 ({per_var}%)", per_var = mice_Uunifrac_PCoS[2]),
+         color = "Treatment") +
+    coord_fixed(1)
+    #annotate("text", x = 0.0, y = 0.1, label = "p = 0.39\nR-squared = 0.11")
+
+UniFracs_combined_Plot = ggpubr::ggarrange(WuniFracs_plot, UuniFracs_plot, 
+                                           nrow = 1,
+                                           common.legend = TRUE,
+                                           labels = "AUTO", 
+                                           legend = "bottom", 
+                                           align = "h")
+
+UniFracs_combined_Plot
+```
+
+## Save plots
+
+```{r}
+# Save all
+ggsave(file.path(fig_dir, "Shannon_plot.pdf"), mice_shannon_plot,  height = 5, width = 5)
+ggsave(file.path(fig_dir, "UniFrac_plot_raw.pdf"), UniFracs_combined_Plot,  height = 7, width = 7)
+```
+
+## Source data
+```{r}
+# Create source data tables
+Shannon_source = mice_alpha %>% 
+  select(Sample, shannon, Condition)
+
+UUnifrac_source = UuniFracs_plot_df %>% 
+  select(Sample, PCo1 = V1, PCo2 = V2, Condition)
+
+WUnifrac_source = WuniFracs_plot_df %>% 
+  select(Sample, PCo1 = V1, PCo2 = V2, Condition)
+```
+
+```{r}
+# Write tables
+Shannon_source %>% 
+  write_tsv(file.path(clean_tables_dir, "6B_Shannon_source.tsv"))
+
+UUnifrac_source %>% 
+  write_tsv(file.path(clean_tables_dir, "6C_right_UUnifrac_source.tsv"))
+
+WUnifrac_source %>% 
+  write_tsv(file.path(clean_tables_dir, "6C_left_UUnifrac_source.tsv"))
+```
+
+```{r}
+Shannon_source %>% 
+  count(Condition)
+
+UUnifrac_source %>% 
+  count(Condition)
+```
+
+# DEBUG
+## Distance to other groups
+```{r}
+# Transform dist matrix to long
+# Add metadata
+Wunifrac_distances_long = mice_Wunifrac %>% 
+  as.data.frame %>% 
+  rownames_to_column("Sample_1") %>% 
+  pivot_longer(cols = -Sample_1, names_to = "Sample_2", values_to = "Distance") %>% 
+  left_join(mice_metadata, by = c("Sample_1" = "Sample")) %>% 
+  left_join(mice_metadata, by = c("Sample_2" = "Sample"), suffix = c("_1", "_2")) %>% 
+  select(matches("Sample"), matches("Condition"), Distance)
+
+Wunifrac_distances_long %>% 
+  group_by(Condition_1, Condition_2) %>% 
+  rstatix::get_summary_stats(Distance, type = "common") %>% 
+  mutate(Self = (Condition_1 == Condition_2), 
+         Contrast = interaction(Condition_1, Condition_2, sep = "~")) %>% 
+  filter(Self == FALSE) %>% 
+  arrange(median)
+
+
+```
+
+
+# Session Info
+```{r}
+sessionInfo()
+```
+```{r}
+WuniFracs_plot_df %>% 
+  arrange(-V1)
+
+mice_asv_filt %>% 
+  filter(Sample %in% c("26NR", "71NR")) %>% 
+  pivot_longer(cols = -Sample) %>% 
+  arrange(-value)
+
+
+```
+
+```{r}
+mice_taxonomy
+```
+
